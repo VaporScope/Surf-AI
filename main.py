@@ -21,10 +21,14 @@ app.add_middleware(
 
 
 # OpenAI connection
-client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY")
-)
+api_key = os.getenv("OPENAI_API_KEY")
 
+print("OPENAI KEY EXISTS:", bool(api_key))
+
+client = OpenAI(
+    api_key=api_key,
+    timeout=60.0
+)
 
 # Request format from Base44
 class ChatRequest(BaseModel):
@@ -43,23 +47,30 @@ def home():
 @app.post("/chat")
 def chat(request: ChatRequest):
 
-    response = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are Surf AI, a friendly helpful assistant."
-            },
-            {
-                "role": "user",
-                "content": request.message
-            }
-        ]
-    )
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are Surf AI, a friendly helpful assistant."
+                },
+                {
+                    "role": "user",
+                    "content": request.message
+                }
+            ]
+        )
 
-    return {
-        "reply": response.choices[0].message.content
-    }
+        return {
+            "reply": response.choices[0].message.content
+        }
+
+    except Exception as e:
+        print("OPENAI ERROR:", str(e))
+        return {
+            "error": str(e)
+        }
 
 
 

@@ -1,108 +1,166 @@
 import os
 import sqlite3
+import uuid
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
-# ----------------------------
-# FastAPI
-# ----------------------------
 
 app = FastAPI(title="Surf AI API")
 
+
+# ----------------------------
+# CORS
+# ----------------------------
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],      # Change this to your Base44 domain later
+    allow_origins=[
+        "https://asksurf.base44.app",
+        "https://app.base44.com",
+        "*"
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+
 # ----------------------------
 # OpenAI
 # ----------------------------
 
+api_key = os.getenv("OPENAI_API_KEY")
+
+print("OPENAI KEY EXISTS:", bool(api_key))
+
 client = OpenAI(
-    api_key=os.getenv("OPENAI_API_KEY"),
-    timeout=60.0
+    api_key=api_key,
+    timeout=60
 )
+
 
 # ----------------------------
 # Database
 # ----------------------------
 
-conn = sqlite3.connect("chat.db", check_same_thread=False)
+conn = sqlite3.connect(
+    "chat_history.db",
+    check_same_thread=False
+)
+
 cursor = conn.cursor()
+
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    conversation_id TEXT NOT NULL,
-    role TEXT NOT NULL,
-    content TEXT NOT NULL
+    conversation_id TEXT,
+    user_id TEXT,
+    role TEXT,
+    content TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 )
 """)
 
 conn.commit()
 
+
 # ----------------------------
-# Models
+# Request Model
 # ----------------------------
 
 class ChatRequest(BaseModel):
-    conversation_id: str
-    message: str
+    conversation_id: str | None = None
+    message: str | None = None
+    user_id: str | None = None
+
 
 # ----------------------------
-# Routes
+# Home
 # ----------------------------
 
 @app.get("/")
 def home():
-    return {"status": "Surf AI is running"}
+    return {
+        "status": "Surf AI is running"
+    }
+
+
+# ----------------------------
+# Chat
+# ----------------------------
 
 @app.post("/chat")
-def chat(request: ChatRequest):
+async def chat(request: ChatRequest):
 
     try:
 
-        # Load previous conversation
+        print("REQUEST RECEIVED:")
+        print(request)
+
+
+        # Create conversation if missing
+        conversation_id = request.conversation_id
+
+        if not conversation_id:
+            conversation_id = str(uuid.uuid4())
+
+
+        # Protect against empty messages
+        if not request.message:
+            return {
+                "error": "No message received"
+            }
+
+
+        # Load history
+
         cursor.execute(
             """
             SELECT role, content
             FROM messages
             WHERE conversation_id=?
-            ORDER BY id
+            ORDER BY id ASC
             """,
-            (request.conversation_id,)
+            (conversation_id,)
         )
+
+
+        history = cursor.fetchall()
+
 
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "You are Surf AI, a friendly helpful assistant."
-                )
+                "content": 
+                "You are Surf AI, a friendly helpful assistant."
             }
         ]
 
-        for role, content in cursor.fetchall():
-            messages.append({
-                "role": role,
-                "content": content
-            })
 
-        # Save user's new message
+        for role, content in history:
+            messages.append(
+                {
+                    "role": role,
+                    "content": content
+                }
+            )
+
+
+        # Save user message
+
         cursor.execute(
             """
             INSERT INTO messages
-            (conversation_id, role, content)
-            VALUES (?, ?, ?)
+            (conversation_id,user_id,role,content)
+            VALUES (?,?,?,?)
             """,
             (
-                request.conversation_id,
+                conversation_id,
+                request.user_id,
                 "user",
                 request.message
             )
@@ -110,28 +168,37 @@ def chat(request: ChatRequest):
 
         conn.commit()
 
-        messages.append({
-            "role": "user",
-            "content": request.message
-        })
 
-        # Ask OpenAI
+        messages.append(
+            {
+                "role": "user",
+                "content": request.message
+            }
+        )
+
+
+        # OpenAI
+
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages
         )
 
+
         reply = response.choices[0].message.content
 
-        # Save assistant reply
+
+        # Save AI response
+
         cursor.execute(
             """
             INSERT INTO messages
-            (conversation_id, role, content)
-            VALUES (?, ?, ?)
+            (conversation_id,user_id,role,content)
+            VALUES (?,?,?,?)
             """,
             (
-                request.conversation_id,
+                conversation_id,
+                request.user_id,
                 "assistant",
                 reply
             )
@@ -139,18 +206,64 @@ def chat(request: ChatRequest):
 
         conn.commit()
 
+
         return {
-            "reply": reply
+            "reply": reply,
+            "conversation_id": conversation_id
         }
 
+
     except Exception as e:
-        print(e)
+
+        print("ERROR:")
+        print(str(e))
+
         return {
             "error": str(e)
         }
 
-@app.post("/clear/{conversation_id}")
-def clear_chat(conversation_id: str):
+
+
+# ----------------------------
+# Get History
+# ----------------------------
+
+@app.get("/history/{conversation_id}")
+def get_history(conversation_id):
+
+    cursor.execute(
+        """
+        SELECT role,content
+        FROM messages
+        WHERE conversation_id=?
+        ORDER BY id
+        """,
+        (conversation_id,)
+    )
+
+
+    data = cursor.fetchall()
+
+
+    return {
+        "conversation_id": conversation_id,
+        "messages": [
+            {
+                "role": role,
+                "content": content
+            }
+            for role,content in data
+        ]
+    }
+
+
+
+# ----------------------------
+# Clear Chat
+# ----------------------------
+
+@app.delete("/history/{conversation_id}")
+def clear_history(conversation_id):
 
     cursor.execute(
         """
@@ -162,35 +275,7 @@ def clear_chat(conversation_id: str):
 
     conn.commit()
 
-    return {
-        "status": "Conversation cleared"
-    }
-
-@app.get("/history/{conversation_id}")
-def history(conversation_id: str):
-
-    cursor.execute(
-        """
-        SELECT role, content
-        FROM messages
-        WHERE conversation_id=?
-        ORDER BY id
-        """,
-        (conversation_id,)
-    )
-
-    rows = cursor.fetchall()
 
     return {
-        "conversation_id": conversation_id,
-        "messages": [
-            {
-                "role": role,
-                "content": content
-            }
-            for role, content in rows
-        ]
+        "status":"deleted"
     }
-
-
-

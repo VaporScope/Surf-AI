@@ -96,8 +96,7 @@ async def chat(request: Request):
         body = await request.json()
         print("INCOMING PAYLOAD:", body)
 
-        # 1. Base44 compatibility fallback check
-        # Some frontend engines use session_id or chat_id instead of conversation_id
+        # Base44 compatibility fallback check
         conversation_id = (
             body.get("conversation_id")
             or body.get("session_id")
@@ -122,7 +121,7 @@ async def chat(request: Request):
                 "conversation_id": conversation_id
             }
 
-        # 2. Load previous memory (Limit to last 20 messages to prevent token limits)
+        # 1. Load previous memory (Limit to last 20 messages to prevent token limits)
         cursor.execute(
             """
             SELECT role, content
@@ -137,18 +136,23 @@ async def chat(request: Request):
         # We read DESC to get the latest messages, then reverse it to read chronologically
         old_messages = cursor.fetchall()[::-1]
 
-        # 3. Construct System Prompt Context
+        # 2. Construct System Prompt Context with your custom identity
         messages = [
             {
                 "role": "system",
-                "content": "You are Surf AI, a friendly helpful assistant. Remember details from earlier in the conversation history to answer follow-up prompts smoothly."
+                "content": (
+                    "You are Surf AI, a friendly and helpful assistant. "
+                    "You were created by an aerospace engineering and AI/ML student at Université Paris-Saclay. "
+                    "If a user asks who made you, who created you, or about your developer, always state clearly that you were built by this student at Université Paris-Saclay. "
+                    "Remember details from earlier in the conversation history to answer follow-up prompts smoothly."
+                )
             }
         ]
 
         for role, content in old_messages:
             messages.append({"role": role, "content": content})
 
-        # 4. Save incoming user message to SQLite memory
+        # 3. Save incoming user message to SQLite memory
         cursor.execute(
             """
             INSERT INTO messages (conversation_id, user_id, role, content)
@@ -161,7 +165,7 @@ async def chat(request: Request):
         # Add current user message to API payload
         messages.append({"role": "user", "content": message})
 
-        # 5. Send complete thread to OpenAI
+        # 4. Send complete thread to OpenAI
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages
@@ -169,7 +173,7 @@ async def chat(request: Request):
 
         reply = response.choices[0].message.content
 
-        # 6. Save AI reply to SQLite memory
+        # 5. Save AI reply to SQLite memory
         cursor.execute(
             """
             INSERT INTO messages (conversation_id, user_id, role, content)
@@ -179,8 +183,7 @@ async def chat(request: Request):
         )
         db.commit()
 
-        # Base44 requires a consistent format. 
-        # Always return the conversation_id back so the frontend can reuse it!
+        # Return response to Base44
         return {
             "reply": reply,
             "conversation_id": conversation_id

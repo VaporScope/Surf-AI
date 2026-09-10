@@ -39,16 +39,17 @@ client = OpenAI(
 
 
 # =========================
-# DATABASE
+# DATABASE (Persistent Path for Render)
 # =========================
+# Render wipes local files unless saved in a persistent disk directory like /data/
+DB_PATH = "/data/surf_memory.db" if os.path.exists("/data") else "surf_memory.db"
 
 db = sqlite3.connect(
-    "surf_memory.db",
+    DB_PATH,
     check_same_thread=False
 )
 
 cursor = db.cursor()
-
 
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS messages (
@@ -59,7 +60,6 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT
 )
 """)
-
 db.commit()
 
 
@@ -73,7 +73,6 @@ class ChatRequest(BaseModel):
     user_id: str | None = None
 
 
-
 # =========================
 # HOME
 # =========================
@@ -85,7 +84,6 @@ def home():
     }
 
 
-
 # =========================
 # CHAT
 # =========================
@@ -94,18 +92,18 @@ def home():
 async def chat(request: Request):
 
     try:
-
         # Read whatever Base44 sends
         body = await request.json()
+        print("INCOMING PAYLOAD:", body)
 
-        print("INCOMING:", body)
-
-
+        # 1. Base44 compatibility fallback check
+        # Some frontend engines use session_id or chat_id instead of conversation_id
         conversation_id = (
             body.get("conversation_id")
+            or body.get("session_id")
+            or body.get("chat_id")
             or str(uuid.uuid4())
         )
-
 
         message = (
             body.get("message")
@@ -113,12 +111,10 @@ async def chat(request: Request):
             or ""
         )
 
-
         user_id = (
             body.get("user_id")
             or "guest"
         )
-
 
         if not message:
             return {
@@ -126,128 +122,75 @@ async def chat(request: Request):
                 "conversation_id": conversation_id
             }
 
-
-
-        # -------------------------
-        # Load memory
-        # -------------------------
-
+        # 2. Load previous memory (Limit to last 20 messages to prevent token limits)
         cursor.execute(
             """
             SELECT role, content
             FROM messages
             WHERE conversation_id=?
-            ORDER BY id ASC
+            ORDER BY id DESC
+            LIMIT 20
             """,
             (conversation_id,)
         )
+        
+        # We read DESC to get the latest messages, then reverse it to read chronologically
+        old_messages = cursor.fetchall()[::-1]
 
-
-        old_messages = cursor.fetchall()
-
-
-
+        # 3. Construct System Prompt Context
         messages = [
             {
                 "role": "system",
-                "content":
-                "You are Surf AI, a friendly helpful assistant. Remember details from the conversation."
+                "content": "You are Surf AI, a friendly helpful assistant. Remember details from earlier in the conversation history to answer follow-up prompts smoothly."
             }
         ]
 
-
         for role, content in old_messages:
-            messages.append(
-                {
-                    "role": role,
-                    "content": content
-                }
-            )
+            messages.append({"role": role, "content": content})
 
-
-
-        # -------------------------
-        # Save user message
-        # -------------------------
-
+        # 4. Save incoming user message to SQLite memory
         cursor.execute(
             """
-            INSERT INTO messages
-            (conversation_id,user_id,role,content)
-            VALUES (?,?,?,?)
+            INSERT INTO messages (conversation_id, user_id, role, content)
+            VALUES (?, ?, ?, ?)
             """,
-            (
-                conversation_id,
-                user_id,
-                "user",
-                message
-            )
+            (conversation_id, user_id, "user", message)
         )
-
         db.commit()
 
+        # Add current user message to API payload
+        messages.append({"role": "user", "content": message})
 
-
-        messages.append(
-            {
-                "role": "user",
-                "content": message
-            }
-        )
-
-
-
-        # -------------------------
-        # OpenAI
-        # -------------------------
-
+        # 5. Send complete thread to OpenAI
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages
         )
 
-
         reply = response.choices[0].message.content
 
-
-
-        # -------------------------
-        # Save AI reply
-        # -------------------------
-
+        # 6. Save AI reply to SQLite memory
         cursor.execute(
             """
-            INSERT INTO messages
-            (conversation_id,user_id,role,content)
-            VALUES (?,?,?,?)
+            INSERT INTO messages (conversation_id, user_id, role, content)
+            VALUES (?, ?, ?, ?)
             """,
-            (
-                conversation_id,
-                user_id,
-                "assistant",
-                reply
-            )
+            (conversation_id, user_id, "assistant", reply)
         )
-
         db.commit()
 
-
-
+        # Base44 requires a consistent format. 
+        # Always return the conversation_id back so the frontend can reuse it!
         return {
             "reply": reply,
             "conversation_id": conversation_id
         }
 
-
-
     except Exception as e:
-
         print("ERROR:", str(e))
-
         return {
             "error": str(e)
         }
-
 
 
 # =========================
@@ -256,7 +199,6 @@ async def chat(request: Request):
 
 @app.get("/history/{conversation_id}")
 def get_history(conversation_id):
-
     cursor.execute(
         """
         SELECT role, content
@@ -266,22 +208,15 @@ def get_history(conversation_id):
         """,
         (conversation_id,)
     )
-
-
     rows = cursor.fetchall()
-
 
     return {
         "conversation_id": conversation_id,
         "messages": [
-            {
-                "role": role,
-                "content": content
-            }
+            {"role": role, "content": content}
             for role, content in rows
         ]
     }
-
 
 
 # =========================
@@ -290,7 +225,6 @@ def get_history(conversation_id):
 
 @app.delete("/history/{conversation_id}")
 def delete_history(conversation_id):
-
     cursor.execute(
         """
         DELETE FROM messages
@@ -298,10 +232,6 @@ def delete_history(conversation_id):
         """,
         (conversation_id,)
     )
-
     db.commit()
 
-
-    return {
-        "status": "deleted"
-    }
+    return {"status": "deleted"}

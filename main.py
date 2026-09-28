@@ -1,6 +1,7 @@
 import os
 import uuid
 import sqlite3
+import base64
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -115,9 +116,13 @@ async def chat(request: Request):
             or "guest"
         )
 
-        if not message:
+        # Grab optional file data sent from the frontend
+        # Expected structure: {"name": "test.png", "type": "image/png", "base64": "..."}
+        file_data = body.get("file")
+
+        if not message and not file_data:
             return {
-                "error": "Empty message",
+                "error": "Empty message and no files provided",
                 "conversation_id": conversation_id
             }
 
@@ -144,6 +149,8 @@ async def chat(request: Request):
                     "You are Surf AI, a friendly and helpful assistant. "
                     "You were created by an aerospace engineering and AI/ML student at Université Paris-Saclay. "
                     "If a user asks who made you, who created you, or about your developer, always state clearly that you were built by this student at Université Paris-Saclay. "
+                    "You can inspect uploaded images or read text contents from uploaded documents. "
+                    "Always refer to the user's provided context files or images if present. "
                     "Remember details from earlier in the conversation history to answer follow-up prompts smoothly."
                 )
             }
@@ -152,20 +159,52 @@ async def chat(request: Request):
         for role, content in old_messages:
             messages.append({"role": role, "content": content})
 
-        # 3. Save incoming user message to SQLite memory
+        # 3. Process the incoming content structure for OpenAI (Handles Text + Images)
+        current_content = []
+        db_log_content = message  # Fallback text to store cleanly in your SQLite database logs
+
+        if message:
+            current_content.append({"type": "text", "text": message})
+
+        if file_data:
+            file_name = file_data.get("name", "uploaded_file")
+            file_type = file_data.get("type", "")
+            base64_str = file_data.get("base64", "")
+
+            # Case A: File is an image (Leverage GPT-4o-mini vision capabilities)
+            if "image" in file_type:
+                current_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{file_type};base64,{base64_str}"}
+                })
+                db_log_content += f" [Sent Image: {file_name}]"
+            
+            # Case B: File is a text-based document (.txt, .md, .csv, .json, etc.)
+            else:
+                try:
+                    # Decode base64 bytes string back into clean readable text context
+                    decoded_text = base64.b64decode(base64_str).decode("utf-8")
+                    file_context = f"\n\n[Attached File Content for reference from '{file_name}']:\n{decoded_text}"
+                    current_content.append({"type": "text", "text": file_context})
+                    db_log_content += f" [Attached Document: {file_name}]"
+                except Exception:
+                    # Fallback string if binary properties can't be string-parsed
+                    current_content.append({"type": "text", "text": f"\n\n[Attached unreadable file placeholder: {file_name}]"})
+
+        # 4. Save incoming user message to SQLite memory database
         cursor.execute(
             """
             INSERT INTO messages (conversation_id, user_id, role, content)
             VALUES (?, ?, ?, ?)
             """,
-            (conversation_id, user_id, "user", message)
+            (conversation_id, user_id, "user", db_log_content)
         )
         db.commit()
 
-        # Add current user message to API payload
-        messages.append({"role": "user", "content": message})
+        # Add current structured payload layer onto runtime array
+        messages.append({"role": "user", "content": current_content})
 
-        # 4. Send complete thread to OpenAI
+        # 5. Send complete thread to OpenAI
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages
@@ -173,7 +212,7 @@ async def chat(request: Request):
 
         reply = response.choices[0].message.content
 
-        # 5. Save AI reply to SQLite memory
+        # 6. Save AI reply to SQLite memory database
         cursor.execute(
             """
             INSERT INTO messages (conversation_id, user_id, role, content)

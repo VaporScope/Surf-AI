@@ -43,7 +43,7 @@ db = sqlite3.connect(
 )
 cursor = db.cursor()
 
-# 1. Table for message history strings
+# Table for message logs
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS messages (
 )
 """)
 
-# 2. NEW: Table to manage custom chat session names/titles
+# Table to manage chat session titles
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS conversations (
     conversation_id TEXT PRIMARY KEY,
@@ -108,14 +108,14 @@ async def chat(request: Request):
                 "conversation_id": conversation_id
             }
 
-        # Automatically register conversation in titles database if it's new
+        # Automatically register conversation in titles database if it's brand new
         cursor.execute(
             "INSERT OR IGNORE INTO conversations (conversation_id, title) VALUES (?, ?)",
             (conversation_id, message[:30] if message else "New Chat")
         )
         db.commit()
 
-        # Load memory history frames
+        # Load previous history entries
         cursor.execute(
             "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 20",
             (conversation_id,)
@@ -164,10 +164,16 @@ async def chat(request: Request):
                 except Exception:
                     current_content.append({"type": "text", "text": f"\n\n[Attached unreadable file placeholder: {file_name}]"})
 
-        # Record user entry
+        # Record user query
         cursor.execute(
             "INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
             (conversation_id, user_id, "user", db_log_content)
+        )
+        
+        # Update conversation time stamp so the latest items bubble up to the top of the sidebar list
+        cursor.execute(
+            "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?",
+            (conversation_id,)
         )
         db.commit()
 
@@ -179,7 +185,7 @@ async def chat(request: Request):
         )
         reply = response.choices[0].message.content
 
-        # Record AI generation
+        # Record assistant response
         cursor.execute(
             "INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
             (conversation_id, user_id, "assistant", reply)
@@ -196,7 +202,28 @@ async def chat(request: Request):
         return {"error": str(e)}
 
 # =========================
-# NEW: RENAME CONVERSATION ENDPOINT
+# NEW: GET ALL CONVERSATIONS LIST FOR SIDEBAR
+# =========================
+@app.get("/history")
+def get_all_conversations():
+    try:
+        cursor.execute(
+            """
+            SELECT conversation_id, title 
+            FROM conversations 
+            ORDER BY updated_at DESC
+            """
+        )
+        rows = cursor.fetchall()
+        return [
+            {"conversation_id": row[0], "title": row[1]}
+            for row in rows
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+# =========================
+# RENAME CONVERSATION
 # =========================
 @app.put("/history/{conversation_id}/rename")
 def rename_conversation(conversation_id: str, request: RenameRequest):
@@ -211,16 +238,14 @@ def rename_conversation(conversation_id: str, request: RenameRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 # =========================
-# GET CHAT HISTORY & TITLE
+# GET SINGLE CHAT HISTORY
 # =========================
 @app.get("/history/{conversation_id}")
 def get_history(conversation_id):
-    # Fetch title
     cursor.execute("SELECT title FROM conversations WHERE conversation_id=?", (conversation_id,))
     title_row = cursor.fetchone()
     chat_title = title_row[0] if title_row else "Untitled Chat"
 
-    # Fetch rows
     cursor.execute(
         "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id ASC",
         (conversation_id,)

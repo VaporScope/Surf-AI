@@ -10,7 +10,7 @@ from openai import OpenAI
 
 app = FastAPI(title="Surf AI API")
 
-# Enable global Cross-Origin Resource Sharing (CORS) for smooth frontend integration
+# Enable global Cross-Origin Resource Sharing (CORS) for frontend integration
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,7 +19,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize global environment api access credentials
+# Environment credentials
 api_key = os.getenv("OPENAI_API_KEY")
 serper_key = os.getenv("SERPER_API_KEY")
 
@@ -31,8 +31,9 @@ client = OpenAI(
     timeout=60
 )
 
-# Persistent volume file pathway setup for database instances
+# Persistent volume path (requires a Render Persistent Disk mounted at /data)
 DB_PATH = "/data/surf_memory.db" if os.path.exists("/data") else "surf_memory.db"
+print("DB PATH:", DB_PATH)
 
 db = sqlite3.connect(
     DB_PATH,
@@ -40,7 +41,7 @@ db = sqlite3.connect(
 )
 cursor = db.cursor()
 
-# Initialize data schemas
+# Initialize schemas
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -60,6 +61,33 @@ CREATE TABLE IF NOT EXISTS conversations (
 """)
 db.commit()
 
+# Migration: add user_id to conversations if it doesn't exist yet
+try:
+    cursor.execute("ALTER TABLE conversations ADD COLUMN user_id TEXT")
+    db.commit()
+except sqlite3.OperationalError:
+    pass  # column already exists
+
+# Backfill user_id for older conversations using the messages table
+cursor.execute("""
+UPDATE conversations
+SET user_id = (
+    SELECT m.user_id FROM messages m
+    WHERE m.conversation_id = conversations.conversation_id
+    LIMIT 1
+)
+WHERE user_id IS NULL
+""")
+db.commit()
+
+cursor.execute(
+    "CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages (conversation_id)"
+)
+cursor.execute(
+    "CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations (user_id)"
+)
+db.commit()
+
 
 # Validation schemas
 class ChatRequest(BaseModel):
@@ -76,7 +104,6 @@ def search_the_web(query: str) -> str:
     if not serper_key:
         return "[System Notice: Live Google web search is currently unavailable because SERPER_API_KEY is missing on Render.]"
     try:
-        # FIXED: correct Serper search endpoint
         url = "https://google.serper.dev/search"
         headers = {
             "X-API-KEY": serper_key,
@@ -116,9 +143,10 @@ def home():
 async def chat(request: Request):
     try:
         body = await request.json()
-        print("INCOMING INTERFACE ACTION:", body)
+        # Log only the keys, not full contents (avoids dumping base64 files into logs)
+        print("INCOMING REQUEST KEYS:", list(body.keys()))
 
-        # Unify various frontend request session conventions
+        # Unify various frontend session conventions
         conversation_id = (
             body.get("conversation_id")
             or body.get("session_id")
@@ -136,10 +164,10 @@ async def chat(request: Request):
                 "conversation_id": conversation_id
             }
 
-        # Initialize tracking index for conversation
+        # Create the conversation row (with user_id) if it doesn't exist
         cursor.execute(
-            "INSERT OR IGNORE INTO conversations (conversation_id, title) VALUES (?, ?)",
-            (conversation_id, message[:30] if message else "New Chat")
+            "INSERT OR IGNORE INTO conversations (conversation_id, user_id, title) VALUES (?, ?, ?)",
+            (conversation_id, user_id, message[:30] if message else "New Chat")
         )
         db.commit()
 
@@ -191,8 +219,6 @@ async def chat(request: Request):
         if message:
             search_data = search_the_web(search_query)
             current_content.append({"type": "text", "text": search_data})
-
-        if message:
             current_content.append({"type": "text", "text": f"User Prompt: {message}"})
 
         # Process images or documents
@@ -232,13 +258,16 @@ async def chat(request: Request):
             model="gpt-4o-mini",
             messages=messages
         )
-        # FIXED: choices is a list
         reply = response.choices[0].message.content
 
         # Record assistant reply
         cursor.execute(
             "INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
             (conversation_id, user_id, "assistant", reply)
+        )
+        cursor.execute(
+            "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?",
+            (conversation_id,)
         )
         db.commit()
 
@@ -266,6 +295,25 @@ async def get_chat_history(conversation_id: str):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.get("/conversations")
+async def list_conversations(user_id: str):
+    try:
+        cursor.execute(
+            "SELECT conversation_id, title, updated_at FROM conversations "
+            "WHERE user_id = ? ORDER BY updated_at DESC",
+            (user_id,)
+        )
+        rows = cursor.fetchall()
+        return {
+            "conversations": [
+                {"conversation_id": r[0], "title": r[1], "updated_at": r[2]}
+                for r in rows
+            ]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.post("/rename/{conversation_id}")
 async def rename_conversation(conversation_id: str, request: RenameRequest):
     try:
@@ -275,5 +323,16 @@ async def rename_conversation(conversation_id: str, request: RenameRequest):
         )
         db.commit()
         return {"status": "success", "conversation_id": conversation_id, "new_title": request.title}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/conversations/{conversation_id}")
+async def delete_conversation(conversation_id: str):
+    try:
+        cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        cursor.execute("DELETE FROM conversations WHERE conversation_id = ?", (conversation_id,))
+        db.commit()
+        return {"status": "deleted", "conversation_id": conversation_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

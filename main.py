@@ -2,6 +2,7 @@ import os
 import uuid
 import sqlite3
 import base64
+import requests
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,17 +16,20 @@ app = FastAPI(title="Surf AI API")
 # =========================
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # Change later to your Base44 URL
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # =========================
-# OPENAI
+# API KEYS & CLIENTS
 # =========================
 api_key = os.getenv("OPENAI_API_KEY")
+tavily_key = os.getenv("TAVILY_API_KEY")
+
 print("OPENAI KEY EXISTS:", bool(api_key))
+print("WEB SEARCH KEY EXISTS:", bool(tavily_key))
 
 client = OpenAI(
     api_key=api_key,
@@ -33,17 +37,13 @@ client = OpenAI(
 )
 
 # =========================
-# DATABASE (Persistent Path for Render)
+# DATABASE
 # =========================
 DB_PATH = "/data/surf_memory.db" if os.path.exists("/data") else "surf_memory.db"
 
-db = sqlite3.connect(
-    DB_PATH,
-    check_same_thread=False
-)
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = db.cursor()
 
-# Table for message logs
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -54,7 +54,6 @@ CREATE TABLE IF NOT EXISTS messages (
 )
 """)
 
-# Table to manage chat session titles
 cursor.execute("""
 CREATE TABLE IF NOT EXISTS conversations (
     conversation_id TEXT PRIMARY KEY,
@@ -74,6 +73,37 @@ class ChatRequest(BaseModel):
 
 class RenameRequest(BaseModel):
     title: str
+
+# =========================
+# HELPER: LIVE WEB SEARCH FUNCTION
+# =========================
+def search_the_web(query: str) -> str:
+    """Queries Tavily API to fetch live search engine text data and reference URLs."""
+    if not tavily_key:
+        return "[System Notice: Live web search is currently unavailable because TAVILY_API_KEY is missing.]"
+    
+    try:
+        url = "https://tavily.com"
+        payload = {
+            "api_key": tavily_key,
+            "query": query,
+            "search_depth": "basic",
+            "include_answer": False
+        }
+        response = requests.post(url, json=payload, timeout=10)
+        
+        if response.status_code == 200:
+            results = response.json().get("results", [])
+            context_string = "\n--- LIVE WEB SEARCH RESULTS ---\n"
+            
+            for i, res in enumerate(results, 1):
+                # Provide index mappings clearly so the AI knows which number points to which real URL
+                context_string += f"Index: [{i}]\nSource Name: {res.get('title')}\nURL: {res.get('url')}\nContent: {res.get('content')}\n\n"
+            
+            return context_string
+        return "[System Notice: Web search failed to respond.]"
+    except Exception as e:
+        return f"[System Notice: Web search error occurred: {str(e)}]"
 
 # =========================
 # HOME
@@ -101,6 +131,7 @@ async def chat(request: Request):
         message = body.get("message") or body.get("content") or ""
         user_id = body.get("user_id") or "guest"
         file_data = body.get("file")
+        location_data = body.get("location")
 
         if not message and not file_data:
             return {
@@ -108,29 +139,34 @@ async def chat(request: Request):
                 "conversation_id": conversation_id
             }
 
-        # Automatically register conversation in titles database if it's brand new
+        # Auto-register new chat titles
         cursor.execute(
             "INSERT OR IGNORE INTO conversations (conversation_id, title) VALUES (?, ?)",
             (conversation_id, message[:30] if message else "New Chat")
         )
         db.commit()
 
-        # Load previous history entries
+        # Load chat history
         cursor.execute(
             "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 20",
             (conversation_id,)
         )
         old_messages = cursor.fetchall()[::-1]
 
+        # 🔒 Privacy & Inline Citation System Instructions
         messages = [
             {
                 "role": "system",
                 "content": (
-                    "You are Surf AI, a friendly and helpful assistant. "
-                    "You were created by an aerospace engineering and AI/ML student at Université Paris-Saclay. "
-                    "If a user asks who made you, who created you, or about your developer, always state clearly that you were built by this student at Université Paris-Saclay. "
-                    "You can inspect uploaded images or read text contents from uploaded documents. "
-                    "Remember details from earlier in the conversation history to answer follow-up prompts smoothly."
+                    "You are Surf AI, a friendly and helpful assistant created by an aerospace engineering and AI/ML student at Université Paris-Saclay. "
+                    "CRITICAL CORE FOCUS: This application places a very high emphasis on user privacy. "
+                    "Reassure users politely about data security if they ask. "
+                    "WEB SEARCH CAPABILITY: You have a live connection to search engines. "
+                    "Below the user's prompt, you will see a section titled '--- LIVE WEB SEARCH RESULTS ---'. "
+                    "Use this live data to answer the user accurately with up-to-date facts. "
+                    "CITATION REQUIREMENT: When using facts from the search results, you MUST cite them inline using clean standard markdown hyperlink formats "
+                    "pointing directly to their source URL string. Format them exactly as a tiny numbered link, for example: [1](URL), [2](URL), etc. "
+                    "DO NOT create a separate Bibliography, Sources list, or reference index at the bottom of the message. Keep everything inline as you type your response."
                 )
             }
         ]
@@ -141,9 +177,24 @@ async def chat(request: Request):
         current_content = []
         db_log_content = message 
 
+        # 1. Trigger live web search
         if message:
-            current_content.append({"type": "text", "text": message})
+            search_data = search_the_web(message)
+            current_content.append({"type": "text", "text": search_data})
 
+        # 2. Inject location context if authorized
+        if location_data:
+            lat = location_data.get("latitude")
+            lon = location_data.get("longitude")
+            current_content.append({
+                "type": "text", 
+                "text": f"\n[User Current Location: Lat {lat}, Lon {lon}]\n"
+            })
+
+        if message:
+            current_content.append({"type": "text", "text": f"User Question: {message}"})
+
+        # 3. Handle File uploads
         if file_data:
             file_name = file_data.get("name", "uploaded_file")
             file_type = file_data.get("type", "")
@@ -158,19 +209,17 @@ async def chat(request: Request):
             else:
                 try:
                     decoded_text = base64.b64decode(base64_str).decode("utf-8")
-                    file_context = f"\n\n[Attached File Context '{file_name}']:\n{decoded_text}"
+                    file_context = f"\n\n[Attached File Content '{file_name}']:\n{decoded_text}"
                     current_content.append({"type": "text", "text": file_context})
                     db_log_content += f" [Attached Document: {file_name}]"
                 except Exception:
                     current_content.append({"type": "text", "text": f"\n\n[Attached unreadable file placeholder: {file_name}]"})
 
-        # Record user query
+        # Record chat log
         cursor.execute(
             "INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
             (conversation_id, user_id, "user", db_log_content)
         )
-        
-        # Update conversation time stamp so the latest items bubble up to the top of the sidebar list
         cursor.execute(
             "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?",
             (conversation_id,)
@@ -179,13 +228,14 @@ async def chat(request: Request):
 
         messages.append({"role": "user", "content": current_content})
 
+        # Generate live answer via OpenAI using search context
         response = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=messages
         )
-        reply = response.choices[0].message.content
+        reply = response.choices.message.content
 
-        # Record assistant response
+        # Record assistant reply
         cursor.execute(
             "INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
             (conversation_id, user_id, "assistant", reply)
@@ -202,23 +252,14 @@ async def chat(request: Request):
         return {"error": str(e)}
 
 # =========================
-# NEW: GET ALL CONVERSATIONS LIST FOR SIDEBAR
+# GET ALL CONVERSATIONS LIST
 # =========================
 @app.get("/history")
 def get_all_conversations():
     try:
-        cursor.execute(
-            """
-            SELECT conversation_id, title 
-            FROM conversations 
-            ORDER BY updated_at DESC
-            """
-        )
+        cursor.execute("SELECT conversation_id, title FROM conversations ORDER BY updated_at DESC")
         rows = cursor.fetchall()
-        return [
-            {"conversation_id": row[0], "title": row[1]}
-            for row in rows
-        ]
+        return [{"conversation_id": row[0], "title": row[1]} for row in rows]
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -228,10 +269,7 @@ def get_all_conversations():
 @app.put("/history/{conversation_id}/rename")
 def rename_conversation(conversation_id: str, request: RenameRequest):
     try:
-        cursor.execute(
-            "UPDATE conversations SET title = ? WHERE conversation_id = ?",
-            (request.title, conversation_id)
-        )
+        cursor.execute("UPDATE conversations SET title = ? WHERE conversation_id = ?", (request.title, conversation_id))
         db.commit()
         return {"status": "success", "message": f"Conversation renamed to {request.title}"}
     except Exception as e:
@@ -244,29 +282,3 @@ def rename_conversation(conversation_id: str, request: RenameRequest):
 def get_history(conversation_id):
     cursor.execute("SELECT title FROM conversations WHERE conversation_id=?", (conversation_id,))
     title_row = cursor.fetchone()
-    chat_title = title_row[0] if title_row else "Untitled Chat"
-
-    cursor.execute(
-        "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id ASC",
-        (conversation_id,)
-    )
-    rows = cursor.fetchall()
-
-    return {
-        "conversation_id": conversation_id,
-        "title": chat_title,
-        "messages": [
-            {"role": role, "content": content}
-            for role, content in rows
-        ]
-    }
-
-# =========================
-# DELETE CHAT
-# =========================
-@app.delete("/history/{conversation_id}")
-def delete_history(conversation_id):
-    cursor.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
-    cursor.execute("DELETE FROM conversations WHERE conversation_id=?", (conversation_id,))
-    db.commit()
-    return {"status": "deleted"}

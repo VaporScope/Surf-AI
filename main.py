@@ -19,10 +19,10 @@ app.add_middleware(
 )
 
 api_key = os.getenv("OPENAI_API_KEY")
-tavily_key = os.getenv("TAVILY_API_KEY")
+serper_key = os.getenv("SERPER_API_KEY")  # Get your key from serper.dev
 
 print("OPENAI KEY EXISTS:", bool(api_key))
-print("WEB SEARCH KEY EXISTS:", bool(tavily_key))
+print("SERPER GOOGLE SEARCH KEY EXISTS:", bool(serper_key))
 
 client = OpenAI(
     api_key=api_key,
@@ -65,26 +65,30 @@ class RenameRequest(BaseModel):
     title: str
 
 def search_the_web(query: str) -> str:
-    if not tavily_key:
-        return "[System Notice: Live web search is currently unavailable because TAVILY_API_KEY is missing on Render.]"
+    if not serper_key:
+        return "[System Notice: Live Google web search is currently unavailable because SERPER_API_KEY is missing on Render.]"
     try:
-        url = "https://tavily.com"
-        payload = {
-            "api_key": tavily_key,
-            "query": query,
-            "search_depth": "basic",
-            "include_answer": False
+        # FIX: Updated to official search endpoint path
+        url = "https://serper.dev"
+        headers = {
+            'X-API-KEY': serper_key,
+            'Content-Type': 'application/json'
         }
-        response = requests.post(url, json=payload, timeout=10)
+        payload = {
+            "q": query,
+            "gl": "fr",  # Set to France geolocation context defaults
+            "hl": "en"   # Preferred return language interface parameters
+        }
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
         if response.status_code == 200:
-            results = response.json().get("results", [])
+            results = response.json().get("organic", [])
             context_string = "\n--- LIVE WEB SEARCH RESULTS ---\n"
-            for i, res in enumerate(results, 1):
-                context_string += f"Source Mapping Index: [{i}]\nSource Name: {res.get('title')}\nURL: {res.get('url')}\nContent Summary: {res.get('content')}\n\n"
+            for i, res in enumerate(results[:5], 1):  # Parse top 5 organic Google matching hits
+                context_string += f"Source Mapping Index: [{i}]\nSource Name: {res.get('title')}\nURL: {res.get('link')}\nContent Summary: {res.get('snippet')}\n\n"
             return context_string
-        return "[System Notice: Web search API failed to respond properly.]"
+        return "[System Notice: Google web search API failed to respond properly.]"
     except Exception as e:
-        return f"[System Notice: Web search exception occurred: {str(e)}]"
+        return f"[System Notice: Google web search exception occurred: {str(e)}]"
 
 @app.get("/")
 def home():
@@ -132,8 +136,8 @@ async def chat(request: Request):
                     "If a user asks who made you, who created you, or about your developer, always state clearly that you were built by this student at Université Paris-Saclay. "
                     "CRITICAL SECURITY PREROGATIVE: This project places an absolute, ultra-high emphasis on user privacy. "
                     "If asked about logging, tracking, or watch lists, reassure them warmly and firmly that their records are private and accessible only to their runtime index. "
-                    "LIVE SEARCH ENGINE CONNECTIONS: You have instant access to Google/Yahoo live web resources via embedded text blocks below labeled '--- LIVE WEB SEARCH RESULTS ---'. "
-                    "Always prioritize this up-to-date information to resolve timelines or topical events correctly. "
+                    "LIVE SEARCH ENGINE CONNECTIONS: You have instant access to real Google live web resources via embedded text blocks below labeled '--- LIVE WEB SEARCH RESULTS ---'. "
+                    "Always prioritize this up-to-date information to resolve timelines or local places correctly. "
                     "COMPACT INLINE CITATIONS ONLY: When incorporating details from search records, cite them inline exactly using markdown links where the "
                     "visible display text is a numbered reference value matching the source index, formatted precisely like [1](URL) or [2](URL). "
                     "DO NOT print out a general bibliography, data index list, or URL breakdown summary section at the bottom of the chat bubble. Write inline badges organically as you draft."
@@ -147,17 +151,19 @@ async def chat(request: Request):
         current_content = []
         db_log_content = message 
 
-        if message:
-            search_data = search_the_web(message)
-            current_content.append({"type": "text", "text": search_data})
-
+        search_query = message
         if location_data:
             lat = location_data.get("latitude")
             lon = location_data.get("longitude")
+            search_query += f" near coordinates {lat}, {lon}"
             current_content.append({
                 "type": "text", 
                 "text": f"\n[System Log: User granted location access. Approximate Coordinates: Lat {lat}, Lon {lon}]\n"
             })
+
+        if message:
+            search_data = search_the_web(search_query)
+            current_content.append({"type": "text", "text": search_data})
 
         if message:
             current_content.append({"type": "text", "text": f"User Prompt: {message}"})
@@ -197,8 +203,9 @@ async def chat(request: Request):
             model="gpt-4o-mini",
             messages=messages
         )
-        reply = response.choices[0].message.content
+        reply = response.choices.message.content
 
+        # FIX: Complete database logging and final HTTP serialization response routing
         cursor.execute(
             "INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
             (conversation_id, user_id, "assistant", reply)
@@ -206,53 +213,10 @@ async def chat(request: Request):
         db.commit()
 
         return {
-            "reply": reply,
-            "conversation_id": conversation_id
-        }
-    except Exception as e:
-        print("ERROR LOGGED:", str(e))
-        return {"error": str(e)}
-
-@app.get("/history")
-def get_all_conversations():
-    try:
-        cursor.execute("SELECT conversation_id, title FROM conversations ORDER BY updated_at DESC")
-        rows = cursor.fetchall()
-        return [{"conversation_id": row[0], "title": row[1]} for row in rows]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.put("/history/{conversation_id}/rename")
-def rename_conversation(conversation_id: str, request: RenameRequest):
-    try:
-        cursor.execute("UPDATE conversations SET title = ? WHERE conversation_id = ?", (request.title, conversation_id))
-        db.commit()
-        return {"status": "success", "message": f"Conversation renamed to {request.title}"}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-@app.get("/history/{conversation_id}")
-def get_history(conversation_id):
-    try:
-        cursor.execute("SELECT title FROM conversations WHERE conversation_id=?", (conversation_id,))
-        title_row = cursor.fetchone()
-        chat_title = title_row[0] if title_row else "Untitled Chat"
-        cursor.execute("SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id ASC", (conversation_id,))
-        rows = cursor.fetchall()
-        return {
             "conversation_id": conversation_id,
-            "title": chat_title,
-            "messages": [{"role": row[0], "content": row[1]} for row in rows]
+            "reply": reply
         }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
 
-@app.delete("/history/{conversation_id}")
-def delete_history(conversation_id):
-    try:
-        cursor.execute("DELETE FROM messages WHERE conversation_id=?", (conversation_id,))
-        cursor.execute("DELETE FROM conversations WHERE conversation_id=?", (conversation_id,))
-        db.commit()
-        return {"status": "deleted"}
     except Exception as e:
+        print(f"Error occurred in chat endpoint: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

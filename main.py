@@ -1,48 +1,61 @@
 import os
+import re
+import json
 import uuid
+import socket
 import sqlite3
 import base64
+import ipaddress
+import threading
 import requests
-from fastapi import FastAPI, Request, HTTPException
+from datetime import datetime, timezone
+from urllib.parse import urlparse, urljoin
+from bs4 import BeautifulSoup
+from fastapi import FastAPI, Body, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from openai import OpenAI
 
 app = FastAPI(title="Surf AI API")
 
-# Enable global Cross-Origin Resource Sharing (CORS) for frontend integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=["*"],  # TODO: restrict to your domain, e.g. https://asksurf.uk
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Environment credentials
 api_key = os.getenv("OPENAI_API_KEY")
 serper_key = os.getenv("SERPER_API_KEY")
+MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+MAX_TOOL_ROUNDS = 3
 
 print("OPENAI KEY EXISTS:", bool(api_key))
-print("SERPER GOOGLE SEARCH KEY EXISTS:", bool(serper_key))
+print("SERPER KEY EXISTS:", bool(serper_key))
+print("MODEL:", MODEL)
 
-client = OpenAI(
-    api_key=api_key,
-    timeout=60
-)
+client = OpenAI(api_key=api_key, timeout=60)
 
-# Persistent volume path (requires a Render Persistent Disk mounted at /data)
+# ---------------------------------------------------------------- Database
 DB_PATH = "/data/surf_memory.db" if os.path.exists("/data") else "surf_memory.db"
 print("DB PATH:", DB_PATH)
 
-db = sqlite3.connect(
-    DB_PATH,
-    check_same_thread=False
-)
-cursor = db.cursor()
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db_lock = threading.Lock()
 
-# Initialize schemas
-cursor.execute("""
+
+def q(sql, params=()):
+    """Run one SQL statement safely from any thread and commit."""
+    with db_lock:
+        cur = db.execute(sql, params)
+        rows = cur.fetchall()
+        db.commit()
+        return rows
+
+
+q("""
 CREATE TABLE IF NOT EXISTS messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     conversation_id TEXT,
@@ -51,25 +64,19 @@ CREATE TABLE IF NOT EXISTS messages (
     content TEXT
 )
 """)
-
-cursor.execute("""
+q("""
 CREATE TABLE IF NOT EXISTS conversations (
     conversation_id TEXT PRIMARY KEY,
     title TEXT,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
 )
 """)
-db.commit()
-
-# Migration: add user_id to conversations if it doesn't exist yet
 try:
-    cursor.execute("ALTER TABLE conversations ADD COLUMN user_id TEXT")
-    db.commit()
+    q("ALTER TABLE conversations ADD COLUMN user_id TEXT")
 except sqlite3.OperationalError:
     pass  # column already exists
 
-# Backfill user_id for older conversations using the messages table
-cursor.execute("""
+q("""
 UPDATE conversations
 SET user_id = (
     SELECT m.user_id FROM messages m
@@ -78,261 +85,448 @@ SET user_id = (
 )
 WHERE user_id IS NULL
 """)
-db.commit()
-
-cursor.execute(
-    "CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages (conversation_id)"
-)
-cursor.execute(
-    "CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations (user_id)"
-)
-db.commit()
-
-
-# Validation schemas
-class ChatRequest(BaseModel):
-    conversation_id: str | None = None
-    message: str | None = None
-    user_id: str | None = None
+q("CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages (conversation_id)")
+q("CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations (user_id)")
 
 
 class RenameRequest(BaseModel):
     title: str
 
 
-def search_the_web(query: str) -> str:
-    if not serper_key:
-        return "[System Notice: Live Google web search is currently unavailable because SERPER_API_KEY is missing on Render.]"
+# ------------------------------------------------------------------- Tools
+TOOLS = [
+    {
+        "type": "function",
+        "function": {
+            "name": "search_web",
+            "description": (
+                "Search Google for current or factual information: news, scores, prices, "
+                "weather, recent events, local places, products, or anything that may have "
+                "changed recently. Do NOT use for greetings, writing, math, coding, or "
+                "stable general knowledge."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Short, specific search query."},
+                    "search_type": {
+                        "type": "string",
+                        "enum": ["web", "news", "places"],
+                        "description": "web = general (default), news = recent news, places = local businesses/locations.",
+                    },
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_page",
+            "description": (
+                "Open a web page and read its text. Use after a search when snippets are not "
+                "enough, or when the user gives a URL. Use at most 2 pages per question."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string", "description": "Full http(s) URL."}},
+                "required": ["url"],
+            },
+        },
+    },
+]
+
+
+def is_safe_url(url: str) -> bool:
+    """Block non-http URLs and private/internal addresses."""
     try:
-        url = "https://google.serper.dev/search"
-        headers = {
-            "X-API-KEY": serper_key,
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "q": query,
-            "gl": "fr",  # France regional search localization
-            "hl": "en"   # Preferred language
-        }
-        response = requests.post(url, headers=headers, json=payload, timeout=10)
-        if response.status_code == 200:
-            results = response.json().get("organic", [])
-            if not results or not isinstance(results, list):
-                return "[System Notice: The search completed successfully but returned zero relevant organic search match results.]"
+        p = urlparse(url)
+        if p.scheme not in ("http", "https") or not p.hostname:
+            return False
+        for info in socket.getaddrinfo(p.hostname, None):
+            ip = ipaddress.ip_address(info[4][0])
+            if (ip.is_private or ip.is_loopback or ip.is_link_local
+                    or ip.is_reserved or ip.is_multicast):
+                return False
+        return True
+    except Exception:
+        return False
 
-            context_string = "\n--- LIVE WEB SEARCH RESULTS ---\n"
-            for i, res in enumerate(results[:5], 1):
-                context_string += (
-                    f"Source Mapping Index: [{i}]\n"
-                    f"Source Name: {res.get('title')}\n"
-                    f"URL: {res.get('link')}\n"
-                    f"Content Summary: {res.get('snippet')}\n\n"
+
+def search_the_web(query: str, search_type: str = "web", state: dict = None) -> str:
+    if state is None:
+        state = {"n": 0}
+    if not query:
+        return "[Notice: empty search query.]"
+    if not serper_key:
+        return "[Notice: web search is unavailable because SERPER_API_KEY is missing.]"
+    endpoint = {"web": "search", "news": "news", "places": "places"}.get(search_type, "search")
+    try:
+        r = requests.post(
+            f"https://google.serper.dev/{endpoint}",
+            headers={"X-API-KEY": serper_key, "Content-Type": "application/json"},
+            json={"q": query, "gl": "fr", "hl": "en"},
+            timeout=10,
+        )
+        if r.status_code != 200:
+            return f"[Notice: search failed with status {r.status_code}.]"
+        data = r.json()
+        out = []
+
+        box = data.get("answerBox")
+        if isinstance(box, dict):
+            ans = box.get("answer") or box.get("snippet")
+            if ans:
+                out.append(f"DIRECT ANSWER (Google): {ans}")
+
+        kg = data.get("knowledgeGraph")
+        if isinstance(kg, dict) and kg.get("title"):
+            line = f"KNOWLEDGE PANEL: {kg.get('title')}"
+            if kg.get("type"):
+                line += f" ({kg['type']})"
+            if kg.get("description"):
+                line += f": {kg['description']}"
+            attrs = kg.get("attributes")
+            if isinstance(attrs, dict):
+                line += " | " + "; ".join(f"{k}: {v}" for k, v in list(attrs.items())[:6])
+            out.append(line)
+
+        if endpoint == "search":
+            for res in (data.get("organic") or [])[:5]:
+                state["n"] += 1
+                out.append(
+                    f"[{state['n']}] {res.get('title')}\nURL: {res.get('link')}\n"
+                    f"{res.get('date', '')} {res.get('snippet', '')}".strip()
                 )
-            return context_string
-        return f"[System Notice: Google web search API failed to respond properly. Status Code: {response.status_code}]"
+        elif endpoint == "news":
+            for res in (data.get("news") or [])[:5]:
+                state["n"] += 1
+                out.append(
+                    f"[{state['n']}] {res.get('title')} ({res.get('source', '')}, {res.get('date', '')})\n"
+                    f"URL: {res.get('link')}\n{res.get('snippet', '')}"
+                )
+        else:
+            for res in (data.get("places") or [])[:5]:
+                state["n"] += 1
+                out.append(
+                    f"[{state['n']}] {res.get('title')} - {res.get('category', '')}\n"
+                    f"Address: {res.get('address', '')} | Rating: {res.get('rating', 'n/a')} "
+                    f"({res.get('ratingCount', 0)} reviews)\n"
+                    f"URL: {res.get('website', '')}"
+                )
+
+        if not out:
+            return "[Notice: the search returned no useful results.]"
+        return "\n\n".join(out)
     except Exception as e:
-        return f"[System Notice: Google web search exception occurred: {str(e)}]"
+        return f"[Notice: search error: {e}]"
 
 
+def read_page(url: str) -> str:
+    """Fetch a page and return cleaned text (max ~5000 chars)."""
+    r = None
+    try:
+        current = url
+        for _ in range(4):
+            if not is_safe_url(current):
+                return "[Notice: that URL cannot be opened.]"
+            r = requests.get(
+                current,
+                headers={"User-Agent": "Mozilla/5.0 (compatible; SurfAI/1.0)"},
+                timeout=8,
+                stream=True,
+                allow_redirects=False,
+            )
+            if r.status_code in (301, 302, 303, 307, 308):
+                current = urljoin(current, r.headers.get("Location", ""))
+                r.close()
+                continue
+            break
+        else:
+            return "[Notice: too many redirects.]"
+
+        if r.status_code != 200:
+            return f"[Notice: the page returned status {r.status_code}.]"
+        ctype = r.headers.get("Content-Type", "")
+        if "html" not in ctype and "text" not in ctype:
+            return "[Notice: that page is not readable text.]"
+
+        raw = r.raw.read(1_000_000, decode_content=True)
+        html = raw.decode(r.encoding or "utf-8", errors="ignore")
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "nav", "footer", "header", "aside",
+                         "form", "noscript", "svg"]):
+            tag.decompose()
+        text = re.sub(r"\s+", " ", soup.get_text(" ", strip=True))
+        if not text:
+            return "[Notice: no readable text found on that page.]"
+        return f"PAGE CONTENT ({current}):\n{text[:5000]}"
+    except Exception as e:
+        return f"[Notice: could not read the page: {e}]"
+    finally:
+        if r is not None:
+            r.close()
+
+
+# ------------------------------------------------------------ System prompt
+def build_system_prompt(user_name, location_data, web_search, response_style, custom_instructions):
+    today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
+    p = (
+        "You are Surf AI, a friendly and helpful assistant created by an aerospace engineering "
+        "and AI/ML student at Université Paris-Saclay. If a user asks who made you, say clearly "
+        "that you were built by this student at Université Paris-Saclay. "
+        "PRIVACY: this project places a strong emphasis on user privacy. If users ask about data "
+        "tracking or logging, be honest: conversations are stored so chat history works, and they "
+        "are not used for advertising or sold to third parties. "
+        f"Today's date is {today} (UTC). "
+    )
+    if user_name:
+        p += f"The user's name is {user_name}. "
+    if location_data:
+        lat, lon = location_data.get("latitude"), location_data.get("longitude")
+        if lat is not None and lon is not None:
+            p += (f"The user's approximate coordinates are {lat}, {lon}. For local questions, "
+                  "work out the nearby city or area and include its name in search queries. ")
+    if web_search:
+        p += (
+            "You have tools: search_web and read_page. Use search_web only when the question needs "
+            "current or verifiable information (news, scores, prices, weather, local places, "
+            "recent releases, anything that may have changed). Do not search for greetings, "
+            "writing, math, coding, or stable general knowledge. Keep queries short. If a search "
+            "returns a DIRECT ANSWER or KNOWLEDGE PANEL, prefer it. If snippets are not enough, "
+            "use read_page on the best 1-2 results. Never say you cannot browse the internet. "
+            "CITATIONS: cite sources inline as markdown links whose visible text is the source "
+            "number, like [1](URL) or [2](URL), using the numbers from the search results. "
+            "Never add a sources list at the end. "
+        )
+    else:
+        p += (
+            "Live web search is turned off in the user's settings. For questions needing current "
+            "information, answer from general knowledge, say it may be out of date, and mention "
+            "they can turn on web search in Settings > Data & Privacy. "
+        )
+    p += f"RESPONSE STYLE: {response_style}. "
+    if custom_instructions:
+        p += f"USER CUSTOM INSTRUCTIONS: {custom_instructions}"
+    return p
+
+
+# --------------------------------------------------------------- Chat engine
+def chat_events(body: dict):
+    """Generator that yields event dicts: meta, status, token, done, error."""
+    try:
+        conversation_id = (
+            body.get("conversation_id") or body.get("session_id")
+            or body.get("chat_id") or str(uuid.uuid4())
+        )
+        message = (body.get("message") or body.get("content") or "").strip()
+        user_id = body.get("user_id") or "guest"
+        user_name = (body.get("user_name") or "").strip()[:50]
+        file_data = body.get("file")
+        location_data = body.get("location")
+        custom_instructions = (body.get("custom_instructions") or "")[:1000]
+        response_style = body.get("response_style") or "Balanced"
+        web_search = body.get("web_search", True) not in (False, "false", 0)
+
+        if not message and not file_data:
+            yield {"type": "error", "text": "Empty message and no files provided", "status": 400}
+            return
+
+        yield {"type": "meta", "conversation_id": conversation_id}
+
+        q("INSERT OR IGNORE INTO conversations (conversation_id, user_id, title) VALUES (?, ?, ?)",
+          (conversation_id, user_id, message[:30] if message else "New Chat"))
+
+        old = q("SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 20",
+                (conversation_id,))[::-1]
+
+        messages = [{"role": "system", "content": build_system_prompt(
+            user_name, location_data, web_search, response_style, custom_instructions)}]
+        for role, content in old:
+            messages.append({"role": role, "content": content})
+
+        parts = [{"type": "text", "text": message or "Please look at the attached file."}]
+        db_log = message
+
+        if file_data:
+            file_name = file_data.get("name", "uploaded_file")
+            file_type = file_data.get("type", "")
+            b64 = file_data.get("base64", "")
+            if "image" in file_type:
+                parts.append({"type": "image_url",
+                              "image_url": {"url": f"data:{file_type};base64,{b64}"}})
+                db_log += f" [Attached Image: {file_name}]"
+            else:
+                try:
+                    text = base64.b64decode(b64).decode("utf-8")[:20000]
+                    parts.append({"type": "text",
+                                  "text": f"\n\n[Contents of Document '{file_name}']:\n{text}"})
+                    db_log += f" [Attached Text Document: {file_name}]"
+                except Exception:
+                    parts.append({"type": "text",
+                                  "text": f"\n\n[Attached Unreadable File: {file_name}]"})
+
+        q("INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
+          (conversation_id, user_id, "user", db_log))
+        q("UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?",
+          (conversation_id,))
+        messages.append({"role": "user", "content": parts})
+
+        state = {"n": 0}
+        full_reply = ""
+
+        for round_no in range(MAX_TOOL_ROUNDS + 1):
+            kwargs = {"model": MODEL, "messages": messages, "stream": True}
+            if web_search and round_no < MAX_TOOL_ROUNDS:
+                kwargs["tools"] = TOOLS
+
+            stream = client.chat.completions.create(**kwargs)
+            round_text = ""
+            calls = {}
+
+            for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+                if delta.content:
+                    round_text += delta.content
+                    full_reply += delta.content
+                    yield {"type": "token", "text": delta.content}
+                if delta.tool_calls:
+                    for tc in delta.tool_calls:
+                        c = calls.setdefault(tc.index, {"id": "", "name": "", "args": ""})
+                        if tc.id:
+                            c["id"] = tc.id
+                        if tc.function:
+                            if tc.function.name:
+                                c["name"] += tc.function.name
+                            if tc.function.arguments:
+                                c["args"] += tc.function.arguments
+
+            if not calls:
+                break
+
+            ordered = [c for _, c in sorted(calls.items())]
+            messages.append({
+                "role": "assistant",
+                "content": round_text or None,
+                "tool_calls": [
+                    {"id": c["id"], "type": "function",
+                     "function": {"name": c["name"], "arguments": c["args"]}}
+                    for c in ordered
+                ],
+            })
+
+            for c in ordered:
+                try:
+                    args = json.loads(c["args"] or "{}")
+                except Exception:
+                    args = {}
+                if c["name"] == "search_web":
+                    yield {"type": "status", "text": f"Searching the web for: {args.get('query', '')}"}
+                    result = search_the_web(args.get("query", ""), args.get("search_type", "web"), state)
+                elif c["name"] == "read_page":
+                    yield {"type": "status", "text": "Reading a page..."}
+                    result = read_page(args.get("url", ""))
+                else:
+                    result = "[Notice: unknown tool.]"
+                messages.append({"role": "tool", "tool_call_id": c["id"], "content": result})
+
+        if not full_reply.strip():
+            full_reply = "Sorry, I couldn't generate a reply. Please try again."
+            yield {"type": "token", "text": full_reply}
+
+        q("INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
+          (conversation_id, user_id, "assistant", full_reply))
+        q("UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?",
+          (conversation_id,))
+        yield {"type": "done", "conversation_id": conversation_id}
+
+    except Exception as e:
+        print(f"Chat error: {e}")
+        yield {"type": "error", "text": str(e), "status": 500}
+
+
+# ---------------------------------------------------------------- Endpoints
 @app.get("/")
 def home():
     return {"status": "Surf AI is running"}
 
 
+@app.post("/chat/stream")
+def chat_stream(body: dict = Body(...)):
+    def gen():
+        for ev in chat_events(body):
+            yield json.dumps(ev, ensure_ascii=False) + "\n"
+
+    return StreamingResponse(
+        gen(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/chat")
-async def chat(request: Request):
-    try:
-        body = await request.json()
-        # Log only the keys, not full contents (avoids dumping base64 files into logs)
-        print("INCOMING REQUEST KEYS:", list(body.keys()))
-
-        # Unify various frontend session conventions
-        conversation_id = (
-            body.get("conversation_id")
-            or body.get("session_id")
-            or body.get("chat_id")
-            or str(uuid.uuid4())
-        )
-        message = body.get("message") or body.get("content") or ""
-        user_id = body.get("user_id") or "guest"
-        file_data = body.get("file")
-        location_data = body.get("location")
-
-        if not message and not file_data:
-            return {
-                "error": "Empty message and no files provided",
-                "conversation_id": conversation_id
-            }
-
-        # Create the conversation row (with user_id) if it doesn't exist
-        cursor.execute(
-            "INSERT OR IGNORE INTO conversations (conversation_id, user_id, title) VALUES (?, ?, ?)",
-            (conversation_id, user_id, message[:30] if message else "New Chat")
-        )
-        db.commit()
-
-        # Reconstruct recent history (last 20 messages)
-        cursor.execute(
-            "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id DESC LIMIT 20",
-            (conversation_id,)
-        )
-        old_messages = cursor.fetchall()[::-1]
-
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "You are Surf AI, a friendly and helpful assistant created by an aerospace engineering and AI/ML student at Université Paris-Saclay. "
-                    "If a user asks who made you, always state clearly that you are built by this specific student at Université Paris-Saclay. "
-                    "PRIVACY: This project places a strong emphasis on user privacy. "
-                    "If users ask about data tracking or message logging, be honest: conversations are stored so that chat history works, "
-                    "and they are not used for advertising or sold to third parties. "
-                    "REAL-TIME SEARCH CAPABILITIES: You have a live connection to Google search. "
-                    "Data containing live updates or local places context will be embedded below the user prompt under '--- LIVE WEB SEARCH RESULTS ---'. "
-                    "STYLE RULES: Never say things like 'I cannot access real-time location data', "
-                    "'I cannot browse the internet', or recommend external services like Google Maps, Yelp, or Uber Eats. "
-                    "If search data is absent or location parsing fails, simply use your general knowledge to answer, or ask the user directly which city, "
-                    "neighborhood, or commune they are currently looking in so you can guide them. "
-                    "COMPACT INLINE CITATIONS ONLY: Cite search data immediately inline using markdown links where the "
-                    "visible text is a numbered reference matching the index value, formatted precisely like [1](URL) or [2](URL). "
-                    "Never output a bibliography block or sources section at the bottom of the response."
-                )
-            }
-        ]
-
-        for role, content in old_messages:
-            messages.append({"role": role, "content": content})
-
-        current_content = []
-        db_log_content = message
-
-        search_query = message
-        if location_data:
-            lat = location_data.get("latitude")
-            lon = location_data.get("longitude")
-            search_query += f" near coordinates {lat}, {lon}"
-            current_content.append({
-                "type": "text",
-                "text": f"\n[System Log: User granted location access. Approximate Coordinates: Lat {lat}, Lon {lon}]\n"
-            })
-
-        if message:
-            search_data = search_the_web(search_query)
-            current_content.append({"type": "text", "text": search_data})
-            current_content.append({"type": "text", "text": f"User Prompt: {message}"})
-
-        # Process images or documents
-        if file_data:
-            file_name = file_data.get("name", "uploaded_file")
-            file_type = file_data.get("type", "")
-            base64_str = file_data.get("base64", "")
-            if "image" in file_type:
-                current_content.append({
-                    "type": "image_url",
-                    "image_url": {"url": f"data:{file_type};base64,{base64_str}"}
-                })
-                db_log_content += f" [Attached Image: {file_name}]"
-            else:
-                try:
-                    decoded_text = base64.b64decode(base64_str).decode("utf-8")
-                    file_context = f"\n\n[Contents of Document '{file_name}']:\n{decoded_text}"
-                    current_content.append({"type": "text", "text": file_context})
-                    db_log_content += f" [Attached Text Document: {file_name}]"
-                except Exception:
-                    current_content.append({"type": "text", "text": f"\n\n[Attached Unreadable File: {file_name}]"})
-
-        # Record user message
-        cursor.execute(
-            "INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
-            (conversation_id, user_id, "user", db_log_content)
-        )
-        cursor.execute(
-            "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?",
-            (conversation_id,)
-        )
-        db.commit()
-
-        messages.append({"role": "user", "content": current_content})
-
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=messages
-        )
-        reply = response.choices[0].message.content
-
-        # Record assistant reply
-        cursor.execute(
-            "INSERT INTO messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)",
-            (conversation_id, user_id, "assistant", reply)
-        )
-        cursor.execute(
-            "UPDATE conversations SET updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?",
-            (conversation_id,)
-        )
-        db.commit()
-
-        return {
-            "conversation_id": conversation_id,
-            "reply": reply
-        }
-
-    except Exception as e:
-        print(f"Error occurred in chat endpoint: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+def chat(body: dict = Body(...)):
+    """Non-streaming version (same engine). Kept for compatibility."""
+    reply, cid = "", None
+    for ev in chat_events(body):
+        if ev["type"] == "meta":
+            cid = ev["conversation_id"]
+        elif ev["type"] == "token":
+            reply += ev["text"]
+        elif ev["type"] == "error":
+            raise HTTPException(status_code=ev.get("status", 500), detail=ev["text"])
+    return {"conversation_id": cid, "reply": reply}
 
 
 @app.get("/history/{conversation_id}")
-async def get_chat_history(conversation_id: str):
+def get_chat_history(conversation_id: str):
     try:
-        cursor.execute(
-            "SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id ASC",
-            (conversation_id,)
-        )
-        rows = cursor.fetchall()
-        history = [{"role": r, "content": c} for r, c in rows]
-        return {"conversation_id": conversation_id, "history": history}
+        rows = q("SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id ASC",
+                 (conversation_id,))
+        return {"conversation_id": conversation_id,
+                "history": [{"role": r, "content": c} for r, c in rows]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/conversations")
-async def list_conversations(user_id: str):
+def list_conversations(user_id: str):
     try:
-        cursor.execute(
-            "SELECT conversation_id, title, updated_at FROM conversations "
-            "WHERE user_id = ? ORDER BY updated_at DESC",
-            (user_id,)
-        )
-        rows = cursor.fetchall()
-        return {
-            "conversations": [
-                {"conversation_id": r[0], "title": r[1], "updated_at": r[2]}
-                for r in rows
-            ]
-        }
+        rows = q("SELECT conversation_id, title, updated_at FROM conversations "
+                 "WHERE user_id = ? ORDER BY updated_at DESC", (user_id,))
+        return {"conversations": [
+            {"conversation_id": r[0], "title": r[1], "updated_at": r[2]} for r in rows]}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/rename/{conversation_id}")
-async def rename_conversation(conversation_id: str, request: RenameRequest):
+def rename_conversation(conversation_id: str, request: RenameRequest):
     try:
-        cursor.execute(
-            "UPDATE conversations SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?",
-            (request.title, conversation_id)
-        )
-        db.commit()
+        q("UPDATE conversations SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?",
+          (request.title, conversation_id))
         return {"status": "success", "conversation_id": conversation_id, "new_title": request.title}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/conversations/{conversation_id}")
-async def delete_conversation(conversation_id: str):
+def delete_conversation(conversation_id: str):
     try:
-        cursor.execute("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
-        cursor.execute("DELETE FROM conversations WHERE conversation_id = ?", (conversation_id,))
-        db.commit()
+        q("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
+        q("DELETE FROM conversations WHERE conversation_id = ?", (conversation_id,))
         return {"status": "deleted", "conversation_id": conversation_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/user/{user_id}/data")
+def delete_user_data(user_id: str):
+    try:
+        q("DELETE FROM messages WHERE user_id = ?", (user_id,))
+        q("DELETE FROM conversations WHERE user_id = ?", (user_id,))
+        return {"status": "deleted", "user_id": user_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

@@ -28,7 +28,7 @@ serper_key = os.getenv("SERPER_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_TOOL_ROUNDS = 3
 
-# AUTH_MODE: "off"    = ignore tokens (old behaviour, rate limits still apply)
+# AUTH_MODE: "off"    = ignore tokens (rate limits still apply)
 #            "soft"   = verify tokens when sent, but still accept unverified requests (rollout)
 #            "strict" = real accounts REQUIRE a valid token
 AUTH_MODE = os.getenv("AUTH_MODE", "soft").lower()
@@ -40,6 +40,9 @@ USER_PER_DAY = int(os.getenv("USER_PER_DAY", "200"))     # chat requests per log
 API_PER_MIN = int(os.getenv("API_PER_MIN", "120"))       # all other endpoints per IP per minute
 MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "4000"))
 MAX_FILE_B64 = int(os.getenv("MAX_FILE_B64", "8000000"))  # ~6 MB file
+GUEST_UPLOADS_PER_DAY = int(os.getenv("GUEST_UPLOADS_PER_DAY", "3"))
+USER_UPLOADS_PER_DAY = int(os.getenv("USER_UPLOADS_PER_DAY", "15"))
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp", "image/gif"}
 
 ALLOWED_ORIGIN_REGEX = os.getenv(
     "ALLOWED_ORIGIN_REGEX",
@@ -158,7 +161,7 @@ _token_lock = threading.Lock()
 
 
 def verify_token(token: str):
-    """Ask the Base44 backend function who this token belongs to. Returns user id or None."""
+    """Ask the verify endpoint who this token belongs to. Returns user id or None."""
     if not token or not AUTH_VERIFY_URL:
         return None
     key = hashlib.sha256(token.encode()).hexdigest()
@@ -255,9 +258,20 @@ def prepare_chat(request: Request, body: dict) -> dict:
     message = body.get("message") or body.get("content") or ""
     if len(message) > MAX_MESSAGE_CHARS:
         raise HTTPException(status_code=413, detail="Message is too long.")
+
     f = body.get("file")
-    if f and len(f.get("base64", "")) > MAX_FILE_B64:
-        raise HTTPException(status_code=413, detail="File is too large.")
+    if f:
+        if len(f.get("base64", "")) > MAX_FILE_B64:
+            raise HTTPException(status_code=413, detail="File is too large.")
+        ftype = (f.get("type") or "").lower()
+        if "image" in ftype and ftype not in ALLOWED_IMAGE_TYPES:
+            raise HTTPException(status_code=415, detail="Unsupported image type. Use JPG, PNG, WebP or GIF.")
+        # Guests are limited by IP so clearing browser data doesn't reset the count
+        up_key = f"upload-day:ip:{ip}" if is_guest else f"upload-day:{identity}"
+        retry = hit(up_key, GUEST_UPLOADS_PER_DAY if is_guest else USER_UPLOADS_PER_DAY, 86400)
+        if retry:
+            too_many(retry, "Daily upload limit reached. Sign in for more uploads."
+                     if is_guest else "Daily upload limit reached. Please try again tomorrow.")
 
     cid = body.get("conversation_id") or body.get("session_id") or body.get("chat_id")
     if cid:
@@ -530,7 +544,7 @@ def chat_events(body: dict):
             b64 = file_data.get("base64", "")
             if "image" in file_type:
                 parts.append({"type": "image_url",
-                              "image_url": {"url": f"data:{file_type};base64,{b64}"}})
+                              "image_url": {"url": f"data:{file_type};base64,{b64}", "detail": "auto"}})
                 db_log += f" [Attached Image: {file_name}]"
             else:
                 try:

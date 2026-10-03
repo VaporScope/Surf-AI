@@ -1,17 +1,20 @@
 import os
 import re
 import json
+import time
 import uuid
 import socket
+import hashlib
 import sqlite3
 import base64
 import ipaddress
 import threading
 import requests
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, Body, HTTPException
+from fastapi import FastAPI, Body, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -19,22 +22,42 @@ from openai import OpenAI
 
 app = FastAPI(title="Surf AI API")
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],  # TODO: restrict to your domain, e.g. https://asksurf.uk
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
+# ------------------------------------------------------------------ Settings
 api_key = os.getenv("OPENAI_API_KEY")
 serper_key = os.getenv("SERPER_API_KEY")
 MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 MAX_TOOL_ROUNDS = 3
 
+# AUTH_MODE: "off"    = ignore tokens (old behaviour, rate limits still apply)
+#            "soft"   = verify tokens when sent, but still accept unverified requests (rollout)
+#            "strict" = real accounts REQUIRE a valid token
+AUTH_MODE = os.getenv("AUTH_MODE", "soft").lower()
+AUTH_VERIFY_URL = os.getenv("AUTH_VERIFY_URL", "")
+
+IP_PER_MIN = int(os.getenv("IP_PER_MIN", "12"))          # chat requests per IP per minute
+GUEST_PER_DAY = int(os.getenv("GUEST_PER_DAY", "30"))    # chat requests per guest per day
+USER_PER_DAY = int(os.getenv("USER_PER_DAY", "200"))     # chat requests per logged-in user per day
+API_PER_MIN = int(os.getenv("API_PER_MIN", "120"))       # all other endpoints per IP per minute
+MAX_MESSAGE_CHARS = int(os.getenv("MAX_MESSAGE_CHARS", "4000"))
+MAX_FILE_B64 = int(os.getenv("MAX_FILE_B64", "8000000"))  # ~6 MB file
+
+ALLOWED_ORIGIN_REGEX = os.getenv(
+    "ALLOWED_ORIGIN_REGEX",
+    r"https://([a-z0-9-]+\.)*(asksurf\.uk|base44\.app|base44\.com)",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=ALLOWED_ORIGIN_REGEX,
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type"],
+)
+
 print("OPENAI KEY EXISTS:", bool(api_key))
 print("SERPER KEY EXISTS:", bool(serper_key))
 print("MODEL:", MODEL)
+print("AUTH_MODE:", AUTH_MODE, "| VERIFY URL SET:", bool(AUTH_VERIFY_URL))
 
 client = OpenAI(api_key=api_key, timeout=60)
 
@@ -91,6 +114,159 @@ q("CREATE INDEX IF NOT EXISTS idx_conversations_user ON conversations (user_id)"
 
 class RenameRequest(BaseModel):
     title: str
+
+
+# ------------------------------------------------------------ Rate limiting
+_hits = defaultdict(deque)
+_hits_lock = threading.Lock()
+
+
+def hit(key: str, limit: int, window: int) -> int:
+    """Record a hit. Returns 0 if allowed, otherwise seconds to wait."""
+    now = time.time()
+    with _hits_lock:
+        if len(_hits) > 20000:  # housekeeping
+            for k in [k for k, v in _hits.items() if not v or v[-1] < now - 86400]:
+                del _hits[k]
+        dq = _hits[key]
+        while dq and dq[0] <= now - window:
+            dq.popleft()
+        if len(dq) >= limit:
+            return int(window - (now - dq[0])) + 1
+        dq.append(now)
+        return 0
+
+
+def client_ip(request: Request) -> str:
+    return request.client.host if request.client else "unknown"
+
+
+def too_many(retry: int, msg: str):
+    raise HTTPException(status_code=429, detail=msg, headers={"Retry-After": str(retry)})
+
+
+def light_limit(request: Request):
+    retry = hit(f"api:{client_ip(request)}", API_PER_MIN, 60)
+    if retry:
+        too_many(retry, "Too many requests. Please slow down.")
+
+
+# ------------------------------------------------------------ Identity/auth
+GUEST_RE = re.compile(r"^guest-[A-Za-z0-9-]{16,64}$")
+_token_cache = {}  # sha256(token) -> (user_id, expires_at)
+_token_lock = threading.Lock()
+
+
+def verify_token(token: str):
+    """Ask the Base44 backend function who this token belongs to. Returns user id or None."""
+    if not token or not AUTH_VERIFY_URL:
+        return None
+    key = hashlib.sha256(token.encode()).hexdigest()
+    now = time.time()
+    with _token_lock:
+        cached = _token_cache.get(key)
+        if cached and cached[1] > now:
+            return cached[0]
+        if len(_token_cache) > 5000:
+            _token_cache.clear()
+    try:
+        r = requests.post(
+            AUTH_VERIFY_URL,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+            json={},
+            timeout=6,
+        )
+        if r.status_code != 200:
+            print(f"AUTH: verify returned {r.status_code}")
+            return None
+        data = r.json()
+        user = data.get("user") if isinstance(data.get("user"), dict) else data
+        uid = user.get("id") or user.get("_id")
+        if not uid:
+            print("AUTH: verify response had no id")
+            return None
+        uid = str(uid)
+        with _token_lock:
+            _token_cache[key] = (uid, now + 300)  # cache 5 minutes
+        return uid
+    except Exception as e:
+        print(f"AUTH: verify error: {e}")
+        return None
+
+
+def identify(request: Request, claimed):
+    """Return (identity, is_guest)."""
+    claimed = (claimed or "").strip()
+    token = ""
+    auth = request.headers.get("authorization", "")
+    if auth.lower().startswith("bearer "):
+        token = auth[7:].strip()
+
+    verified = verify_token(token) if (token and AUTH_MODE != "off") else None
+    if verified:
+        return verified, False
+
+    is_guest_id = bool(GUEST_RE.match(claimed))
+    is_anon = claimed in ("", "guest")
+
+    if AUTH_MODE == "strict":
+        if is_guest_id:
+            return claimed, True
+        if is_anon:
+            return "guest", True
+        raise HTTPException(status_code=401, detail="Please sign in again.")
+
+    # off / soft: accept the claimed id (rollout period)
+    if is_guest_id or is_anon:
+        return (claimed or "guest"), True
+    return claimed, False
+
+
+def owner_of(conversation_id: str):
+    rows = q("SELECT user_id FROM conversations WHERE conversation_id = ?", (conversation_id,))
+    return rows[0][0] if rows else None
+
+
+def require_owner(conversation_id: str, identity: str):
+    """Read/rename/delete access: the conversation must belong to the caller."""
+    owner = owner_of(conversation_id)
+    if owner is None:
+        return
+    if identity == "guest" and AUTH_MODE != "strict":
+        return  # rollout: older frontend does not send user_id on every call yet
+    if identity == "guest" or owner != identity:
+        raise HTTPException(status_code=404, detail="Conversation not found")
+
+
+def prepare_chat(request: Request, body: dict) -> dict:
+    ip = client_ip(request)
+    retry = hit(f"chat-min:{ip}", IP_PER_MIN, 60)
+    if retry:
+        too_many(retry, "You're sending messages too fast. Please wait a moment.")
+
+    identity, is_guest = identify(request, body.get("user_id"))
+    day_key = f"chat-day:{identity}" + (f":{ip}" if identity == "guest" else "")
+    retry = hit(day_key, GUEST_PER_DAY if is_guest else USER_PER_DAY, 86400)
+    if retry:
+        msg = ("Daily message limit reached for guests. Sign in for a higher limit."
+               if is_guest else "Daily message limit reached. Please try again tomorrow.")
+        too_many(retry, msg)
+
+    message = body.get("message") or body.get("content") or ""
+    if len(message) > MAX_MESSAGE_CHARS:
+        raise HTTPException(status_code=413, detail="Message is too long.")
+    f = body.get("file")
+    if f and len(f.get("base64", "")) > MAX_FILE_B64:
+        raise HTTPException(status_code=413, detail="File is too large.")
+
+    cid = body.get("conversation_id") or body.get("session_id") or body.get("chat_id")
+    if cid:
+        owner = owner_of(cid)
+        if owner is not None and owner != identity:
+            raise HTTPException(status_code=403, detail="This conversation belongs to someone else.")
+
+    body["user_id"] = identity
+    return body
 
 
 # ------------------------------------------------------------------- Tools
@@ -444,7 +620,7 @@ def chat_events(body: dict):
 
     except Exception as e:
         print(f"Chat error: {e}")
-        yield {"type": "error", "text": str(e), "status": 500}
+        yield {"type": "error", "text": "Something went wrong. Please try again.", "status": 500}
 
 
 # ---------------------------------------------------------------- Endpoints
@@ -454,7 +630,9 @@ def home():
 
 
 @app.post("/chat/stream")
-def chat_stream(body: dict = Body(...)):
+def chat_stream(request: Request, body: dict = Body(...)):
+    body = prepare_chat(request, body)
+
     def gen():
         for ev in chat_events(body):
             yield json.dumps(ev, ensure_ascii=False) + "\n"
@@ -467,8 +645,9 @@ def chat_stream(body: dict = Body(...)):
 
 
 @app.post("/chat")
-def chat(body: dict = Body(...)):
+def chat(request: Request, body: dict = Body(...)):
     """Non-streaming version (same engine). Kept for compatibility."""
+    body = prepare_chat(request, body)
     reply, cid = "", None
     for ev in chat_events(body):
         if ev["type"] == "meta":
@@ -481,52 +660,76 @@ def chat(body: dict = Body(...)):
 
 
 @app.get("/history/{conversation_id}")
-def get_chat_history(conversation_id: str):
+def get_chat_history(conversation_id: str, request: Request, user_id: str = ""):
+    light_limit(request)
+    identity, _ = identify(request, user_id)
+    require_owner(conversation_id, identity)
     try:
         rows = q("SELECT role, content FROM messages WHERE conversation_id=? ORDER BY id ASC",
                  (conversation_id,))
         return {"conversation_id": conversation_id,
                 "history": [{"role": r, "content": c} for r, c in rows]}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"History error: {e}")
+        raise HTTPException(status_code=500, detail="Could not load history.")
 
 
 @app.get("/conversations")
-def list_conversations(user_id: str):
+def list_conversations(request: Request, user_id: str = ""):
+    light_limit(request)
+    identity, _ = identify(request, user_id)
+    if identity == "guest":
+        return {"conversations": []}
     try:
         rows = q("SELECT conversation_id, title, updated_at FROM conversations "
-                 "WHERE user_id = ? ORDER BY updated_at DESC", (user_id,))
+                 "WHERE user_id = ? ORDER BY updated_at DESC", (identity,))
         return {"conversations": [
             {"conversation_id": r[0], "title": r[1], "updated_at": r[2]} for r in rows]}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"List error: {e}")
+        raise HTTPException(status_code=500, detail="Could not load conversations.")
 
 
 @app.post("/rename/{conversation_id}")
-def rename_conversation(conversation_id: str, request: RenameRequest):
+def rename_conversation(conversation_id: str, payload: RenameRequest,
+                        request: Request, user_id: str = ""):
+    light_limit(request)
+    identity, _ = identify(request, user_id)
+    require_owner(conversation_id, identity)
+    title = payload.title.strip()[:100] or "Untitled"
     try:
         q("UPDATE conversations SET title = ?, updated_at = CURRENT_TIMESTAMP WHERE conversation_id = ?",
-          (request.title, conversation_id))
-        return {"status": "success", "conversation_id": conversation_id, "new_title": request.title}
+          (title, conversation_id))
+        return {"status": "success", "conversation_id": conversation_id, "new_title": title}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Rename error: {e}")
+        raise HTTPException(status_code=500, detail="Could not rename.")
 
 
 @app.delete("/conversations/{conversation_id}")
-def delete_conversation(conversation_id: str):
+def delete_conversation(conversation_id: str, request: Request, user_id: str = ""):
+    light_limit(request)
+    identity, _ = identify(request, user_id)
+    require_owner(conversation_id, identity)
     try:
         q("DELETE FROM messages WHERE conversation_id = ?", (conversation_id,))
         q("DELETE FROM conversations WHERE conversation_id = ?", (conversation_id,))
         return {"status": "deleted", "conversation_id": conversation_id}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Delete error: {e}")
+        raise HTTPException(status_code=500, detail="Could not delete.")
 
 
 @app.delete("/user/{user_id}/data")
-def delete_user_data(user_id: str):
+def delete_user_data(user_id: str, request: Request):
+    light_limit(request)
+    identity, _ = identify(request, user_id)
+    if identity == "guest" or identity != user_id:
+        raise HTTPException(status_code=403, detail="Not allowed.")
     try:
         q("DELETE FROM messages WHERE user_id = ?", (user_id,))
         q("DELETE FROM conversations WHERE user_id = ?", (user_id,))
         return {"status": "deleted", "user_id": user_id}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Delete user data error: {e}")
+        raise HTTPException(status_code=500, detail="Could not delete data.")

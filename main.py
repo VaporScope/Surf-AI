@@ -462,9 +462,9 @@ def read_page(url: str) -> str:
 def build_system_prompt(user_name, location_data, web_search, response_style, custom_instructions):
     today = datetime.now(timezone.utc).strftime("%A, %d %B %Y")
     p = (
-        "You are Surf AI, a friendly and helpful assistant created by an aerospace engineering "
-        "and AI/ML student at Université Paris-Saclay. If a user asks who made you, say clearly "
-        "that you were built by this student at Université Paris-Saclay. "
+        "You are Surf AI, a friendly and helpful assistant created by an"
+        "and AI/ML student at Aivancity. If a user asks who made you, say clearly "
+        "that you were built by this student at Aivancity. "
         "PRIVACY: this project places a strong emphasis on user privacy. If users ask about data "
         "tracking or logging, be honest: conversations are stored so chat history works, and they "
         "are not used for advertising or sold to third parties. "
